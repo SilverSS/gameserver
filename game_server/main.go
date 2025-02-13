@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,7 +9,8 @@ import (
 	"math/rand"
 	"net/http"
 	"runtime"
-	"sync"
+
+	"golang.org/x/sync/semaphore"
 
 	"github.com/SilverSS/gameserver/types"
 	"github.com/anthdm/hollywood/actor"
@@ -55,7 +57,7 @@ func (s *PlayerSession) cleanup() {
 func (s *PlayerSession) readLoop() {
 	defer s.cleanup()
 
-	fmt.Printf("client %s : session %d started\n", s.clientID, s.sessionID)
+	fmt.Printf("client %d : session %d started\n", s.clientID, s.sessionID)
 
 	var msg types.WSMessage
 	for {
@@ -88,7 +90,7 @@ func (s *PlayerSession) handleMessage(msg types.WSMessage) {
 			fmt.Printf("playerState unmarshal error: %v\n", err)
 			return
 		}
-		//fmt.Println(ps)
+		fmt.Printf("client : %d = %v\n", s.clientID, ps)
 	}
 }
 
@@ -105,12 +107,13 @@ func newPlayerSession(sid int, conn *websocket.Conn, server *GameServer) actor.P
 type GameServer struct {
 	ctx      *actor.Context
 	sessions map[*actor.PID]struct{}
-	mu       sync.RWMutex
+	sem      *semaphore.Weighted
 }
 
 func newGameServer() actor.Receiver {
 	return &GameServer{
 		sessions: make(map[*actor.PID]struct{}),
+		sem:      semaphore.NewWeighted(int64(runtime.NumCPU())),
 	}
 }
 
@@ -123,9 +126,12 @@ func (s *GameServer) Receive(c *actor.Context) {
 }
 
 func (s *GameServer) removeSession(pid *actor.PID) {
-	s.mu.Lock()
+	if err := s.sem.Acquire(context.Background(), 1); err != nil {
+		fmt.Printf("Failed to acquire semaphore: %v\n", err)
+		return
+	}
 	delete(s.sessions, pid)
-	s.mu.Unlock()
+	s.sem.Release(1)
 	fmt.Printf("client with pid %s disconnected\n", pid)
 }
 
@@ -159,9 +165,12 @@ func (s *GameServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	sid := rand.Intn(math.MaxInt)
 	pid := s.ctx.SpawnChild(newPlayerSession(sid, conn, s), fmt.Sprintf("playersession_%d", sid))
 
-	s.mu.Lock()
+	if err := s.sem.Acquire(context.Background(), 1); err != nil {
+		fmt.Printf("Failed to acquire semaphore: %v\n", err)
+		return
+	}
 	s.sessions[pid] = struct{}{}
-	s.mu.Unlock()
+	s.sem.Release(1)
 
 	fmt.Printf("client with sid %d and pid %s just connected\n", sid, pid)
 }
@@ -170,6 +179,7 @@ var port string
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	// fmt.Println("Processors: ", runtime.NumCPU())
 
 	portFlag := flag.String("port", "9160", "<portNumber>")
 	flag.Parse()
