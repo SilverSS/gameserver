@@ -67,7 +67,7 @@ func (c *GameClient) login() error {
 }
 
 func (c *GameClient) sendRandomPosition(ctx context.Context) {
-	ticker := time.NewTicker(time.Microsecond * 50)
+	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
 
 	for {
@@ -131,7 +131,7 @@ func main() {
 	port := flag.String("port", "9160", "WebSocket server port")
 	count := flag.Int("clients", 1000, "Number of clients")
 	flag.Parse()
-	wsServerEndpoint = fmt.Sprintf("ws://Localhost:%s/ws", *port)
+	wsServerEndpoint = fmt.Sprintf("ws://eos916.asuscomm.com:%s/ws", *port)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
