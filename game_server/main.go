@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"runtime"
+	"sync"
 
 	"github.com/SilverSS/gameserver/types"
 	"github.com/anthdm/hollywood/actor"
@@ -26,25 +27,48 @@ type PlayerSession struct {
 	username  string
 	inLobby   bool
 	conn      *websocket.Conn
+	server    *GameServer
+	done      chan struct{}
+	pid       *actor.PID
 }
 
 // Receive implements actor.Receiver.
 func (s *PlayerSession) Receive(c *actor.Context) {
 	switch c.Message().(type) {
 	case actor.Started:
-		s.readLoop()
-		//c.SpawnChild(newPlayerState, "playerState")
+		s.pid = c.PID()
+		s.done = make(chan struct{})
+		go s.readLoop()
+	case actor.Stopped:
+		s.cleanup()
+	}
+}
+
+func (s *PlayerSession) cleanup() {
+	close(s.done)
+	s.conn.Close()
+	if s.server != nil {
+		s.server.removeSession(s.pid)
 	}
 }
 
 func (s *PlayerSession) readLoop() {
+	defer s.cleanup()
+
+	fmt.Printf("client %s : session %d started\n", s.clientID, s.sessionID)
+
 	var msg types.WSMessage
 	for {
-		if err := s.conn.ReadJSON(&msg); err != nil {
-			fmt.Println("read error", err)
+		select {
+		case <-s.done:
 			return
+		default:
+			if err := s.conn.ReadJSON(&msg); err != nil {
+				fmt.Printf("read error for session %d: %v\n", s.sessionID, err)
+				return
+			}
+			s.handleMessage(msg)
 		}
-		go s.handleMessage(msg)
 	}
 }
 
@@ -53,24 +77,27 @@ func (s *PlayerSession) handleMessage(msg types.WSMessage) {
 	case "login":
 		var loginMsg types.Login
 		if err := json.Unmarshal(msg.Data, &loginMsg); err != nil {
-			panic(err)
+			fmt.Printf("login unmarshal error: %v\n", err)
+			return
 		}
 		s.clientID = loginMsg.ClientID
 		s.username = loginMsg.Username
 	case "playerState":
 		var ps types.PlayerState
 		if err := json.Unmarshal(msg.Data, &ps); err != nil {
-			panic(err)
+			fmt.Printf("playerState unmarshal error: %v\n", err)
+			return
 		}
-		fmt.Println(ps)
+		//fmt.Println(ps)
 	}
 }
 
-func newPlayerSession(sid int, conn *websocket.Conn) actor.Producer {
+func newPlayerSession(sid int, conn *websocket.Conn, server *GameServer) actor.Producer {
 	return func() actor.Receiver {
 		return &PlayerSession{
 			conn:      conn,
 			sessionID: sid,
+			server:    server,
 		}
 	}
 }
@@ -78,6 +105,7 @@ func newPlayerSession(sid int, conn *websocket.Conn) actor.Producer {
 type GameServer struct {
 	ctx      *actor.Context
 	sessions map[*actor.PID]struct{}
+	mu       sync.RWMutex
 }
 
 func newGameServer() actor.Receiver {
@@ -87,12 +115,18 @@ func newGameServer() actor.Receiver {
 }
 
 func (s *GameServer) Receive(c *actor.Context) {
-	switch msg := c.Message().(type) {
+	switch c.Message().(type) {
 	case actor.Started:
 		s.startHTTP()
 		s.ctx = c
-		_ = msg
 	}
+}
+
+func (s *GameServer) removeSession(pid *actor.PID) {
+	s.mu.Lock()
+	delete(s.sessions, pid)
+	s.mu.Unlock()
+	fmt.Printf("client with pid %s disconnected\n", pid)
 }
 
 func (s *GameServer) startHTTP() {
@@ -100,16 +134,20 @@ func (s *GameServer) startHTTP() {
 	go func() {
 		http.HandleFunc("/ws", s.handleWS)
 		strPort := fmt.Sprintf(":%s", port)
-		http.ListenAndServe(strPort, nil)
+		if err := http.ListenAndServe(strPort, nil); err != nil {
+			fmt.Printf("HTTP server error: %v\n", err)
+		}
 	}()
 }
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // 개발 환경을 위한 설정, 프로덕션에서는 적절히 수정 필요
+	},
 }
 
-// handles the upgrade of the websocket
 func (s *GameServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -119,8 +157,12 @@ func (s *GameServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Println("new client is trying to connect")
 	sid := rand.Intn(math.MaxInt)
-	pid := s.ctx.SpawnChild(newPlayerSession(sid, conn), fmt.Sprintf("playersession_%d", sid))
+	pid := s.ctx.SpawnChild(newPlayerSession(sid, conn, s), fmt.Sprintf("playersession_%d", sid))
+
+	s.mu.Lock()
 	s.sessions[pid] = struct{}{}
+	s.mu.Unlock()
+
 	fmt.Printf("client with sid %d and pid %s just connected\n", sid, pid)
 }
 
@@ -133,7 +175,12 @@ func main() {
 	flag.Parse()
 	port = *portFlag
 
-	e, _ := actor.NewEngine(actor.NewEngineConfig())
+	e, err := actor.NewEngine(actor.NewEngineConfig())
+	if err != nil {
+		fmt.Printf("failed to create actor engine: %v\n", err)
+		return
+	}
+
 	e.Spawn(newGameServer, "server")
 	select {}
 }

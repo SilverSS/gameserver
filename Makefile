@@ -1,6 +1,5 @@
 client:
 	@go build -o bin/client game_client/main.go
-	@./bin/client
 
 client-amd64:
 	@GOOS=windows GOARCH=amd64 go build -o bin/client_amd64.exe game_client/main.go
