@@ -35,13 +35,11 @@ func (c *GameClient) close() {
 	close(c.done)
 }
 
-func (c *GameClient) start(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
-	defer c.close()
-
+func (c *GameClient) start(ctx context.Context) {
 	// 로그인 시도
 	if err := c.login(); err != nil {
 		log.Printf("Client %s login failed: %v", c.username, err)
+		c.close()
 		return
 	}
 
@@ -73,6 +71,7 @@ func (c *GameClient) sendRandomPosition(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			c.close() // context 종료 시 명확하게 close 호출
 			return
 		case <-ticker.C:
 			x := float32(rand.Intn(100000)) / 1000.0
@@ -85,7 +84,14 @@ func (c *GameClient) sendRandomPosition(ctx context.Context) {
 			}
 			b, err := json.Marshal(state)
 			if err != nil {
-				log.Printf("Client %s marshal error: %v", c.username, err)
+				select {
+				case <-ctx.Done():
+					c.close()
+					return
+				default:
+					log.Printf("Client %s marshal error: %v", c.username, err)
+				}
+				c.close()
 				return
 			}
 			msg := types.WSMessage{
@@ -93,7 +99,14 @@ func (c *GameClient) sendRandomPosition(ctx context.Context) {
 				Data: b,
 			}
 			if err := c.conn.WriteJSON(msg); err != nil {
-				log.Printf("Client %s write error: %v", c.username, err)
+				select {
+				case <-ctx.Done():
+					c.close()
+					return
+				default:
+					log.Printf("Client %s write error: %v", c.username, err)
+				}
+				c.close()
 				return
 			}
 		}
@@ -121,17 +134,17 @@ func runClient(ctx context.Context, wg *sync.WaitGroup, id int) {
 		done:     make(chan struct{}),
 	}
 
-	wg.Add(1)
-	go client.start(ctx, wg)
+	client.start(ctx)
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	port := flag.String("port", "9160", "WebSocket server port")
-	count := flag.Int("clients", 1000, "Number of clients")
+	count := flag.Int("clients", 100000, "Number of clients")
 	flag.Parse()
-	wsServerEndpoint = fmt.Sprintf("ws://eos916.asuscomm.com:%s/ws", *port)
+	//wsServerEndpoint = fmt.Sprintf("ws://eos916.asuscomm.com:%s/ws", *port)
+	wsServerEndpoint = fmt.Sprintf("ws://127.0.0.1:%s/ws", *port)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -141,19 +154,22 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	clientCount := *count
-
 	var wg sync.WaitGroup
 
-	// 클라이언트 생성 및 실행
-	for i := 0; i < clientCount; i++ {
-		wg.Add(1)
-		go runClient(ctx, &wg, i)
-		time.Sleep(time.Millisecond * 10) // 연결 제한 방지를 위한 지연
-	}
+	// 클라이언트 생성 루프를 별도 고루틴에서 실행
+	go func() {
+		for i := 0; i < clientCount; i++ {
+			wg.Add(1)
+			go runClient(ctx, &wg, i)
+			time.Sleep(time.Millisecond * 10) // 연결 제한 방지를 위한 지연
+		}
+	}()
 
-	// 종료 시그널 대기
+	// 종료 시그널 대기 및 즉시 메시지 출력
 	<-sigChan
-	log.Println("Shutting down...")
+	log.Println("프로그램 종료를 시작합니다...")
 	cancel()
 	wg.Wait()
+	log.Println("프로그램 종료 완료")
+	os.Exit(0)
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,12 +8,13 @@ import (
 	"math/rand"
 	"net/http"
 	"runtime"
-
-	"golang.org/x/sync/semaphore"
+	"strings"
+	"sync"
 
 	"github.com/SilverSS/gameserver/types"
 	"github.com/anthdm/hollywood/actor"
 	"github.com/gorilla/websocket"
+	"golang.org/x/sync/semaphore"
 )
 
 type PlayerState struct {
@@ -47,10 +47,16 @@ func (s *PlayerSession) Receive(c *actor.Context) {
 }
 
 func (s *PlayerSession) cleanup() {
-	close(s.done)
-	s.conn.Close()
-	if s.server != nil {
-		s.server.removeSession(s.pid)
+	select {
+	case <-s.done:
+		// 이미 cleanup 됨
+		return
+	default:
+		close(s.done)
+		s.conn.Close()
+		if s.server != nil {
+			s.server.removeSession(s.pid)
+		}
 	}
 }
 
@@ -65,8 +71,30 @@ func (s *PlayerSession) readLoop() {
 		case <-s.done:
 			return
 		default:
-			if err := s.conn.ReadJSON(&msg); err != nil {
-				fmt.Printf("read error for session %d: %v\n", s.sessionID, err)
+			err := s.conn.ReadJSON(&msg)
+			if err != nil {
+				// 1. websocket.CloseError 타입인 경우
+				if closeErr, ok := err.(*websocket.CloseError); ok {
+					switch closeErr.Code {
+					case websocket.CloseNormalClosure:
+						fmt.Printf("client %d : session %d 정상 종료 (CloseNormalClosure)\n", s.clientID, s.sessionID)
+					case websocket.CloseGoingAway:
+						fmt.Printf("client %d : session %d 정상 종료 (CloseGoingAway)\n", s.clientID, s.sessionID)
+					case websocket.CloseAbnormalClosure:
+						fmt.Printf("client %d : session %d 비정상 종료 (CloseAbnormalClosure)\n", s.clientID, s.sessionID)
+					default:
+						fmt.Printf("client %d : session %d 종료 (code=%d, text=%s)\n", s.clientID, s.sessionID, closeErr.Code, closeErr.Text)
+					}
+					// 2. 네트워크 연결이 이미 닫힌 경우
+				} else if strings.Contains(err.Error(), "use of closed network connection") {
+					fmt.Printf("client %d : session %d 네트워크 연결 종료 (use of closed network connection)\n", s.clientID, s.sessionID)
+					// 3. 타임아웃 등 기타 네트워크 에러
+				} else if strings.Contains(err.Error(), "i/o timeout") {
+					fmt.Printf("client %d : session %d 네트워크 타임아웃\n", s.clientID, s.sessionID)
+					// 4. 기타 예상치 못한 에러
+				} else {
+					fmt.Printf("client %d : session %d 예기치 않은 read error: %v\n", s.clientID, s.sessionID, err)
+				}
 				return
 			}
 			s.handleMessage(msg)
@@ -90,7 +118,7 @@ func (s *PlayerSession) handleMessage(msg types.WSMessage) {
 			fmt.Printf("playerState unmarshal error: %v\n", err)
 			return
 		}
-		fmt.Printf("client : %d = %v\n", s.clientID, ps)
+		//fmt.Printf("client : %d = %v\n", s.clientID, ps)
 	}
 }
 
@@ -107,13 +135,15 @@ func newPlayerSession(sid int, conn *websocket.Conn, server *GameServer) actor.P
 type GameServer struct {
 	ctx      *actor.Context
 	sessions map[*actor.PID]struct{}
-	sem      *semaphore.Weighted
+	mu       sync.Mutex          // 세션 맵 보호용 뮤텍스
+	connSem  *semaphore.Weighted // 동시 접속자 제한용 세마포어
 }
 
 func newGameServer() actor.Receiver {
 	return &GameServer{
 		sessions: make(map[*actor.PID]struct{}),
-		sem:      semaphore.NewWeighted(int64(runtime.NumCPU())),
+		mu:       sync.Mutex{},
+		connSem:  semaphore.NewWeighted(10000), // 최대 10,000명 동시 접속 제한
 	}
 }
 
@@ -126,12 +156,9 @@ func (s *GameServer) Receive(c *actor.Context) {
 }
 
 func (s *GameServer) removeSession(pid *actor.PID) {
-	if err := s.sem.Acquire(context.Background(), 1); err != nil {
-		fmt.Printf("Failed to acquire semaphore: %v\n", err)
-		return
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.sessions, pid)
-	s.sem.Release(1)
 	fmt.Printf("client with pid %s disconnected\n", pid)
 }
 
@@ -155,6 +182,13 @@ var upgrader = websocket.Upgrader{
 }
 
 func (s *GameServer) handleWS(w http.ResponseWriter, r *http.Request) {
+	// 세마포어 획득 시도
+	if err := s.connSem.Acquire(r.Context(), 1); err != nil {
+		http.Error(w, "서버 동시 접속자 수가 초과되었습니다.", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.connSem.Release(1) // 반드시 반환
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Println("ws upgrade err: ", err)
@@ -165,12 +199,9 @@ func (s *GameServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	sid := rand.Intn(math.MaxInt)
 	pid := s.ctx.SpawnChild(newPlayerSession(sid, conn, s), fmt.Sprintf("playersession_%d", sid))
 
-	if err := s.sem.Acquire(context.Background(), 1); err != nil {
-		fmt.Printf("Failed to acquire semaphore: %v\n", err)
-		return
-	}
+	s.mu.Lock()
 	s.sessions[pid] = struct{}{}
-	s.sem.Release(1)
+	s.mu.Unlock()
 
 	fmt.Printf("client with sid %d and pid %s just connected\n", sid, pid)
 }
