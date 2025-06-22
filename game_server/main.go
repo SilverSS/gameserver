@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/SilverSS/gameserver/types"
 	"github.com/anthdm/hollywood/actor"
@@ -17,11 +18,8 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-type PlayerState struct {
-	Position types.Vector
-	Health   int
-	Velocity types.Vector
-}
+// 서버가 관리하는 이동 속도(유닛/초)
+const serverMoveSpeed = 1.0
 
 type PlayerSession struct {
 	sessionID int
@@ -32,6 +30,15 @@ type PlayerSession struct {
 	server    *GameServer
 	done      chan struct{}
 	pid       *actor.PID
+
+	state      types.PlayerState // 서버가 관리하는 실제 상태
+	target     types.Vector
+	moving     bool
+	lastUpdate time.Time
+
+	correctionStop chan struct{} // 보정 루프 종료용 채널
+
+	writeMu sync.Mutex // WebSocket Write 보호용 뮤텍스 추가
 }
 
 // Receive implements actor.Receiver.
@@ -40,6 +47,7 @@ func (s *PlayerSession) Receive(c *actor.Context) {
 	case actor.Started:
 		s.pid = c.PID()
 		s.done = make(chan struct{})
+		s.lastUpdate = time.Now()
 		go s.readLoop()
 	case actor.Stopped:
 		s.cleanup()
@@ -47,6 +55,7 @@ func (s *PlayerSession) Receive(c *actor.Context) {
 }
 
 func (s *PlayerSession) cleanup() {
+	s.stopPositionCorrection()
 	select {
 	case <-s.done:
 		// 이미 cleanup 됨
@@ -102,6 +111,7 @@ func (s *PlayerSession) readLoop() {
 	}
 }
 
+// 클라이언트 메시지 처리: 목표 위치, 상태 갱신
 func (s *PlayerSession) handleMessage(msg types.WSMessage) {
 	switch msg.Type {
 	case "login":
@@ -112,14 +122,173 @@ func (s *PlayerSession) handleMessage(msg types.WSMessage) {
 		}
 		s.clientID = loginMsg.ClientID
 		s.username = loginMsg.Username
-	case "playerState":
-		var ps types.PlayerState
-		if err := json.Unmarshal(msg.Data, &ps); err != nil {
-			fmt.Printf("playerState unmarshal error: %v\n", err)
+	case "moveRequest":
+		// 이동 요청 수신: 목표 위치 저장, 이동 상태로 전환, 이동 승인 메시지 전송
+		var req types.MoveRequest
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			fmt.Printf("moveRequest unmarshal error: %v\n", err)
 			return
 		}
-		//fmt.Printf("client : %d = %v\n", s.clientID, ps)
+		s.target = req.Target
+		s.state.Target = req.Target
+		s.moving = true
+		s.lastUpdate = time.Now()
+		// 이동 승인 메시지 전송
+		approved := types.MoveApproved{
+			Target: req.Target,
+			Speed:  serverMoveSpeed,
+		}
+		sendWS(s.conn, "moveApproved", approved, &s.writeMu)
+		// 이동 승인 시점에 세션별 보정 루프 시작
+		s.startPositionCorrection()
 	}
+}
+
+// 세션별 위치 보정 루프 (이동 승인 시점에만 실행)
+func (s *PlayerSession) startPositionCorrection() {
+	// 이미 실행 중이면 중복 실행 방지
+	if s.correctionStop != nil {
+		return
+	}
+	s.correctionStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		defer func() { s.correctionStop = nil }()
+		for {
+			select {
+			case <-ticker.C:
+				if !s.moving {
+					return // 이동 종료 시 루프 종료
+				}
+				now := time.Now()
+				dt := float32(now.Sub(s.lastUpdate).Seconds())
+				s.lastUpdate = now
+
+				cur := s.state.Position
+				tgt := s.target
+				dir := normalize(subtract(tgt, cur))
+				move := multiply(dir, serverMoveSpeed*dt)
+				next := add(cur, move)
+
+				// 목표 위치 도달 체크
+				if distance(next, tgt) < 0.01 || dot(subtract(tgt, cur), dir) <= 0 {
+					next = tgt
+					s.moving = false
+					s.state.MoveState = 0 // Idle
+				} else {
+					s.state.MoveState = 1 // Moving
+				}
+				s.state.Position = next
+
+				// 위치 보정 메시지 전송 (Mutex로 보호)
+				correction := types.PositionCorrection{Position: next}
+				sendWS(s.conn, "positionCorrection", correction, &s.writeMu)
+			case <-s.correctionStop:
+				return
+			}
+		}
+	}()
+}
+
+// 이동 종료 시 보정 루프 종료 (cleanup 등에서 호출)
+func (s *PlayerSession) stopPositionCorrection() {
+	if s.correctionStop != nil {
+		close(s.correctionStop)
+		s.correctionStop = nil
+	}
+}
+
+// 0.2초마다 이동 상태인 세션의 위치 계산 및 보정 메시지 전송
+func (s *GameServer) startPositionCorrection() {
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			<-ticker.C
+			s.mu.Lock()
+			for pid := range s.sessions {
+				session, ok := s.getSessionByPID(pid)
+				if ok && session.moving {
+					now := time.Now()
+					dt := float32(now.Sub(session.lastUpdate).Seconds())
+					session.lastUpdate = now
+
+					cur := session.state.Position
+					tgt := session.target
+					dir := normalize(subtract(tgt, cur))
+					move := multiply(dir, serverMoveSpeed*dt)
+					next := add(cur, move)
+
+					// 목표 위치 도달 체크
+					if distance(next, tgt) < 0.01 || dot(subtract(tgt, cur), dir) <= 0 {
+						next = tgt
+						session.moving = false
+						session.state.MoveState = 0 // Idle
+					} else {
+						session.state.MoveState = 1 // Moving
+					}
+					session.state.Position = next
+
+					// 위치 보정 메시지 전송
+					correction := types.PositionCorrection{Position: next}
+					sendWS(session.conn, "positionCorrection", correction, &session.writeMu)
+				}
+			}
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// 유틸: 메시지 전송 (세션별 Mutex로 보호)
+func sendWS(conn *websocket.Conn, msgType string, v interface{}, mu *sync.Mutex) {
+	data, _ := json.Marshal(v)
+	msg := types.WSMessage{
+		Type: msgType,
+		Data: data,
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	conn.WriteJSON(msg)
+}
+
+// 벡터 연산 함수들
+func subtract(a, b types.Vector) types.Vector {
+	return types.Vector{a.X - b.X, a.Y - b.Y, a.Z - b.Z}
+}
+func add(a, b types.Vector) types.Vector {
+	return types.Vector{a.X + b.X, a.Y + b.Y, a.Z + b.Z}
+}
+func multiply(a types.Vector, scalar float32) types.Vector {
+	return types.Vector{a.X * scalar, a.Y * scalar, a.Z * scalar}
+}
+func length(a types.Vector) float32 {
+	return float32(math.Sqrt(float64(a.X*a.X + a.Y*a.Y + a.Z*a.Z)))
+}
+func normalize(a types.Vector) types.Vector {
+	l := length(a)
+	if l == 0 {
+		return types.Vector{0, 0, 0}
+	}
+	return types.Vector{a.X / l, a.Y / l, a.Z / l}
+}
+func distance(a, b types.Vector) float32 {
+	return length(subtract(a, b))
+}
+func dot(a, b types.Vector) float32 {
+	return a.X*b.X + a.Y*b.Y + a.Z*b.Z
+}
+
+// getSessionByPID 유틸 함수 예시 (실제 구현 필요)
+func (s *GameServer) getSessionByPID(pid *actor.PID) (*PlayerSession, bool) {
+	// 실제 구현에 맞게 세션을 찾아 반환해야 함
+	return nil, false // 예시
+}
+
+// JSON 마샬 유틸
+func mustJsonMarshal(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func newPlayerSession(sid int, conn *websocket.Conn, server *GameServer) actor.Producer {

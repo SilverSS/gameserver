@@ -1,2 +1,9 @@
 bin/
 .DS_Store
+.vscode/
+*.csproj
+*.sln
+Library/
+Temp/
+UserSettings/
+Logs/
