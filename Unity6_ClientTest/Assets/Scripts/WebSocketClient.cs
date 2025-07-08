@@ -8,8 +8,10 @@ using System.Threading;
 public class WebSocketClient : MonoBehaviour
 {
     private WebSocket ws;
-    private Action<Vector3, float> onMoveApproved;
-    private Action<Vector3> onPositionCorrection;
+    public event System.Action<Vector3, float> onMoveApproved;
+    public event System.Action<Vector3> onPositionCorrection;
+    public event System.Action<bool, string> onRegisterResponse;
+    public event System.Action<bool, string> onLoginResponse;
 
     private int clientId;
     private string username;
@@ -21,12 +23,9 @@ public class WebSocketClient : MonoBehaviour
     private CancellationTokenSource connectCts;
     private bool isConnected = false;
 
-    public void Init(string url, int clientId, string username, Action<Vector3, float> onMoveApproved, Action<Vector3> onPositionCorrection)
+    public void Init(string url, string username)
     {
-        this.clientId = clientId;
         this.username = username;
-        this.onMoveApproved = onMoveApproved;
-        this.onPositionCorrection = onPositionCorrection;
         retryCount = 0;
         isConnected = false;
         connectCts = new CancellationTokenSource();
@@ -111,6 +110,16 @@ public class WebSocketClient : MonoBehaviour
                 var pos = new Vector3(corr.position.X, corr.position.Y, corr.position.Z);
                 onPositionCorrection?.Invoke(pos);
             }
+            else if (wsMsg.type == "registerResponse")
+            {
+                var resp = wsMsg.DecodeData<RegisterResponse>();
+                onRegisterResponse?.Invoke(resp.success, resp.message);
+            }
+            else if (wsMsg.type == "loginResponse")
+            {
+                var resp = wsMsg.DecodeData<LoginResponse>();
+                onLoginResponse?.Invoke(resp.success, resp.message);
+            }
         };
 
         try
@@ -141,6 +150,24 @@ public class WebSocketClient : MonoBehaviour
         await ws.SendText(JsonUtility.ToJson(msg));
     }
 
+    public async void SendRegister(string username, string password)
+    {
+        if (ws == null || ws.State != WebSocketState.Open)
+            return;
+        var req = new RegisterRequest { username = username, password = password };
+        var msg = WSMessage.Create("register", req);
+        await ws.SendText(JsonUtility.ToJson(msg));
+    }
+
+    public async void SendLogin(string username, string password)
+    {
+        if (ws == null || ws.State != WebSocketState.Open)
+            return;
+        var req = new LoginRequest { username = username, password = password };
+        var msg = WSMessage.Create("login", req);
+        await ws.SendText(JsonUtility.ToJson(msg));
+    }
+
     void Update()
     {
         ws?.DispatchMessageQueue();
@@ -153,5 +180,10 @@ public class WebSocketClient : MonoBehaviour
             try { await ws.Close(); } catch { }
         }
         connectCts?.Cancel();
+    }
+
+    public NativeWebSocket.WebSocketState GetState()
+    {
+        return ws != null ? ws.State : NativeWebSocket.WebSocketState.Closed;
     }
 }
