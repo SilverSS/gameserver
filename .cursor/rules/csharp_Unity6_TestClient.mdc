@@ -1,0 +1,14 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Unity6_ClientTest Rules
+
+- 이 디렉토리는 Unity 엔진(C#) 기반의 테스트 및 스트레스 테스트용 클라이언트 코드만 포함한다.
+- 서버와의 통신은 WebSocket을 사용하며, types 디렉토리의 프로토콜 정의와 1:1로 매칭되는 구조체/클래스를 사용한다.
+- 테스트 목적에 따라 다양한 시나리오(동시 접속, 메시지 폭주 등)를 구현할 수 있다.
+- 실제 게임 로직이 아닌, 네트워크 및 프로토콜 검증이 주 목적이다.
+- 코드 스타일은 Unity/C# 표준을 따른다.
+- 외부 패키지 추가 시 반드시 목적과 버전을 명시한다.
+- **모든 UI 텍스트는 UnityEngine.UI.Text가 아닌 TMPro.TextMeshProUGUI를 사용한다.**
