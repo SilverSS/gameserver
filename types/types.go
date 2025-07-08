@@ -35,3 +35,35 @@ type PlayerState struct {
 	Target    Vector `json:"Target"`
 	MoveState int    `json:"moveState"` // 0: Idle, 1: Moving
 }
+
+// 회원가입 요청
+// 클라이언트 -> 서버
+// { "username": "string", "password": "string" }
+type RegisterRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// 회원가입 응답
+// 서버 -> 클라이언트
+// { "success": true, "message": "string" }
+type RegisterResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// 로그인 요청
+// 클라이언트 -> 서버
+// { "username": "string", "password": "string" }
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// 로그인 응답
+// 서버 -> 클라이언트
+// { "success": true, "message": "string" }
+type LoginResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
